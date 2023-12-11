@@ -48,7 +48,7 @@ pub mod block_io;
 pub use block_io::{FileBlockIO, ReqwestBlockIO};
 
 pub mod block_req;
-pub(crate) use block_req::{BlockReq, BlockReqWaiter};
+pub(crate) use block_req::{BlockReq, BlockReqWaiter, BlockRes};
 
 mod mend;
 pub use mend::{DownstairsMend, ExtentFix, RegionMetadata};
@@ -1666,7 +1666,7 @@ async fn test_buffer_len_over_block_size() {
  * well. The first three are the supported operations, the other operations
  * tell the upstairs to behave in specific ways.
  */
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum BlockOp {
     Read {
         offset: Block,
@@ -1689,7 +1689,6 @@ pub enum BlockOp {
     },
     Deactivate,
     // Management commands
-    RepairOp,
     ReplaceDownstairs {
         id: Uuid,
         old: SocketAddr,
@@ -1844,7 +1843,7 @@ struct GtoS {
      * If the sender is None, we know it's a request from the Upstairs and
      * we don't have to ACK it to anyone.
      */
-    req: Option<BlockReq>,
+    res: Option<BlockRes>,
 }
 
 impl GtoS {
@@ -1853,7 +1852,7 @@ impl GtoS {
     pub fn new(
         ds_id: JobId,
         guest_buffer: Option<Buffer>,
-        req: Option<BlockReq>,
+        res: Option<BlockRes>,
     ) -> GtoS {
         let mut submitted = HashSet::new();
         submitted.insert(ds_id);
@@ -1863,7 +1862,7 @@ impl GtoS {
             guest_buffers.insert(ds_id, guest_buffer);
         }
 
-        GtoS::new_bulk(submitted, guest_buffers, req)
+        GtoS::new_bulk(submitted, guest_buffers, res)
     }
 
     /// Create a new GtoS object where one Guest IO request maps to many
@@ -1871,14 +1870,14 @@ impl GtoS {
     pub fn new_bulk(
         submitted: HashSet<JobId>,
         guest_buffers: HashMap<JobId, Buffer>,
-        req: Option<BlockReq>,
+        res: Option<BlockRes>,
     ) -> GtoS {
         GtoS {
             submitted,
             completed: Vec::new(),
             guest_buffers,
             downstairs_responses: HashMap::new(),
-            req,
+            res,
         }
     }
 
@@ -1939,8 +1938,11 @@ impl GtoS {
          * given up because an IO took too long, or other possible
          * guest side reasons.
          */
-        if let Some(req) = self.req {
-            req.send_result(result);
+        if let Some(res) = self.res {
+            match result {
+                Ok(_) => res.send_ok(),
+                Err(e) => res.send_err(e),
+            }
         }
     }
 
@@ -2274,12 +2276,11 @@ impl Guest {
      * This is used to submit a new BlockOp IO request to Crucible.
      */
     async fn send(&self, op: BlockOp) -> BlockReqWaiter {
-        let (send, recv) = oneshot::channel();
-
-        self.reqs.lock().await.push_back(BlockReq::new(op, send));
+        let (brw, res) = BlockReqWaiter::pair();
+        self.reqs.lock().await.push_back(BlockReq { op, res });
         self.notify.notify_one();
 
-        BlockReqWaiter::new(recv)
+        brw
     }
 
     /*
@@ -2493,6 +2494,30 @@ impl Guest {
             tokio::time::sleep(bp).await;
             drop(_guard);
         }
+    }
+}
+
+impl Drop for Guest {
+    fn drop(&mut self) {
+        // Any BlockReqs or GuestWork which remains pending on this Guest when
+        // it is dropped should be issued an error completion.  This avoids
+        // dropping BlockRes BlockRes instances prior to completion (which
+        // results in a panic).
+
+        self.reqs.get_mut().drain(..).for_each(|req| {
+            req.res.send_err(CrucibleError::GenericError(
+                "Guest purging remaining BlockReqs during drop()".to_string(),
+            ));
+        });
+        self.guest_work
+            .get_mut()
+            .active
+            .drain()
+            .for_each(|(_id, gtos)| {
+                gtos.notify(Err(CrucibleError::GenericError(
+                    "Guest purging remaining GtoSs during drop()".to_string(),
+                )));
+            });
     }
 }
 
